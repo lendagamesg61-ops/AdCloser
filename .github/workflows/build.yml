@@ -1,0 +1,349 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Criar projeto
+        run: |
+          mkdir -p AdCloser && cd AdCloser
+          mkdir -p app app/src/main app/src/main/java/com/example/adcloser app/src/main/res/values app/src/main/res/xml
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "AdCloser"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.adcloser"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.adcloser"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("com.google.mlkit:text-recognition:16.0.0")
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".AdCloserService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagIncludeNotImportantViews"
+              android:canRetrieveWindowContent="true"
+              android:canPerformGestures="true"
+              android:canTakeScreenshot="true"
+              android:notificationTimeout="200"
+              android:description="@string/service_desc" />
+          EOF
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">Fecha Anúncios</string>
+              <string name="service_desc">Fecha anúncios automaticamente: procura botões de fechar na tela e toca neles.</string>
+          </resources>
+          EOF
+          cat > app/src/main/java/com/example/adcloser/MainActivity.kt <<'EOF'
+          package com.example.adcloser
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.Switch
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 96, 48, 48)
+                  }
+                  col.addView(TextView(this).apply {
+                      text = "1) Toque no botão abaixo e ative \"Fecha Anúncios\" em Acessibilidade.\n2) Deixe o interruptor ligado e abra seu jogo.\n"
+                      textSize = 16f
+                  })
+                  col.addView(Switch(this).apply {
+                      text = "Fechar anúncios automaticamente"
+                      isChecked = prefs.getBoolean("on", true)
+                      setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean("on", c).apply() }
+                  })
+                  col.addView(Button(this).apply {
+                      text = "Abrir configurações de acessibilidade"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+                  setContentView(col)
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/example/adcloser/AdCloserService.kt <<'EOF'
+          package com.example.adcloser
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Bitmap
+          import android.graphics.Path
+          import android.graphics.Rect
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.view.Display
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import android.annotation.TargetApi
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.text.TextRecognition
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+
+          class AdCloserService : AccessibilityService() {
+
+              private val handler = Handler(Looper.getMainLooper())
+              private val ocr = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+
+              private var running = false      // laço de tentativas ativo
+              private var adLike = false       // janela atual parece de anúncio
+              private var busy = false         // OCR em andamento
+              private var attempts = 0
+              private var lastScan = 0L
+              private var lastStop = 0L
+
+              // Trechos de nomes de classe/pacote típicos de SDKs de anúncio (edite à vontade)
+              private val adClasses = listOf(
+                  "adactivity", "gms.ads", "applovin", "unity3d.ads", "unity3d.services.ads", "ironsource",
+                  "vungle", "chartboost", "mbridge", "inmobi", "adcolony", "pangle", "bytedance.sdk",
+                  "fyber", "tapjoy", "admob", "mintegral", "startapp", "facebook.ads"
+              )
+              // Rótulos de botão de fechar (texto exato ou no começo/fim)
+              private val closeWords = listOf("close", "fechar", "skip", "pular", "dismiss", "fechar anúncio", "skip ad", "pular anúncio")
+              // Frases fortes: só estas valem quando não temos certeza de que é anúncio
+              private val strongWords = listOf("close ad", "skip ad", "fechar anúncio", "fechar anuncio", "pular anúncio", "pular anuncio")
+              private val xGlyphs = setOf("x", "×", "✕", "✖", "✗", "⨉")
+              private val outsidePkgs = setOf("com.android.vending", "com.android.chrome", "com.google.android.googlequicksearchbox")
+
+              private fun enabled() = getSharedPreferences("cfg", MODE_PRIVATE).getBoolean("on", true)
+
+              // ---------- eventos ----------
+              override fun onAccessibilityEvent(e: AccessibilityEvent) {
+                  if (!enabled() || e.packageName == packageName) return
+                  when (e.eventType) {
+                      AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
+                          val id = "${e.packageName} ${e.className}".lowercase()
+                          adLike = adClasses.any { id.contains(it) }
+                          if (adLike || rootInActiveWindow?.let { findClose(it, true) } != null) start()
+                      }
+                      AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+                          val now = SystemClock.uptimeMillis()
+                          if (running || now - lastScan < 1000 || now - lastStop < 5000) return
+                          lastScan = now
+                          val root = rootInActiveWindow ?: return
+                          if (findClose(root, true) != null) start()
+                      }
+                  }
+              }
+
+              override fun onInterrupt() {}
+
+              // ---------- laço de tentativas ----------
+              private val tick = object : Runnable {
+                  override fun run() {
+                      if (attempts >= 10 || !enabled()) { stop(); return }
+                      step()
+                      handler.postDelayed(this, 1000)
+                  }
+              }
+
+              private fun start() {
+                  if (running) return
+                  running = true; attempts = 0
+                  handler.postDelayed(tick, 700)
+              }
+
+              private fun stop() {
+                  running = false
+                  lastStop = SystemClock.uptimeMillis()
+                  handler.removeCallbacks(tick)
+              }
+
+              private fun step() {
+                  if (busy) return
+                  val root = rootInActiveWindow
+                  val pkg = root?.packageName?.toString()
+
+                  // Caiu na Play Store/navegador por um clique no anúncio: volta
+                  if (pkg in outsidePkgs) { performGlobalAction(GLOBAL_ACTION_BACK); attempts++; return }
+
+                  // Camada 1: nós de acessibilidade
+                  val node = root?.let { findClose(it, strong = !adLike) }
+                  if (node != null) { clickNode(node); attempts++; return }
+
+                  if (!adLike) { attempts += 3; return }   // sem sinal de anúncio: encerra logo
+
+                  // Camada 2: OCR (Android 11+)
+                  if (Build.VERSION.SDK_INT >= 30) { ocrStep(); return }
+
+                  attempts++
+              }
+
+              // ---------- camada 1 ----------
+              private fun labels(n: AccessibilityNodeInfo) =
+                  listOfNotNull(n.text, n.contentDescription).map { it.toString().trim().lowercase() }
+
+              private fun isClose(t: String, strong: Boolean) =
+                  strongWords.any { t.contains(it) } ||
+                      (!strong && closeWords.any { t == it || t.startsWith("$it ") || t.endsWith(" $it") })
+
+              private fun findClose(n: AccessibilityNodeInfo, strong: Boolean = false): AccessibilityNodeInfo? {
+                  if (n.isVisibleToUser && labels(n).any { isClose(it, strong) }) return n
+                  for (i in 0 until n.childCount) {
+                      val c = n.getChild(i) ?: continue
+                      findClose(c, strong)?.let { return it }
+                  }
+                  return null
+              }
+
+              private fun clickNode(n: AccessibilityNodeInfo) {
+                  var c: AccessibilityNodeInfo? = n
+                  while (c != null && !c.isClickable) c = c.parent
+                  if (c != null && c.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return
+                  val r = Rect(); n.getBoundsInScreen(r)
+                  tap(r.exactCenterX(), r.exactCenterY())
+              }
+
+              private fun tap(x: Float, y: Float) {
+                  val p = Path().apply { moveTo(x, y) }
+                  val g = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(p, 0, 60)).build()
+                  dispatchGesture(g, null, null)
+              }
+
+              // ---------- camada 2: print + OCR ----------
+              @TargetApi(30)
+              private fun ocrStep() {
+                  busy = true
+                  takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
+                      override fun onSuccess(r: ScreenshotResult) {
+                          val bmp = Bitmap.wrapHardwareBuffer(r.hardwareBuffer, r.colorSpace)
+                              ?.copy(Bitmap.Config.ARGB_8888, false)
+                          r.hardwareBuffer.close()
+                          if (bmp == null) finishOcr() else findByOcr(bmp)
+                      }
+                      override fun onFailure(errorCode: Int) = finishOcr()
+                  })
+              }
+
+              private fun finishOcr() { busy = false; attempts++ }
+
+              private fun recognize(bmp: Bitmap, cb: (List<Pair<String, Rect>>) -> Unit) {
+                  ocr.process(InputImage.fromBitmap(bmp, 0))
+                      .addOnSuccessListener { r ->
+                          cb(r.textBlocks.flatMap { it.lines }.mapNotNull { l -> l.boundingBox?.let { l.text to it } })
+                      }
+                      .addOnFailureListener { cb(emptyList()) }
+              }
+
+              private fun findByOcr(bmp: Bitmap) {
+                  // 2a) tela inteira: procura "Fechar", "Skip", "Pular"...
+                  recognize(bmp) { lines ->
+                      val hit = lines.firstOrNull { isClose(it.first.trim().lowercase(), false) }
+                      if (hit != null) {
+                          tap(hit.second.exactCenterX(), hit.second.exactCenterY()); finishOcr()
+                      } else {
+                          // 2b) cantos ampliados: procura o símbolo X
+                          val w = bmp.width; val h = bmp.height
+                          val cw = (w * 0.22f).toInt(); val ch = (h * 0.12f).toInt()
+                          val corners = listOf(w - cw to 0, 0 to 0, w - cw to h - ch, 0 to h - ch)
+                          scanCorner(bmp, corners, cw, ch, 0)
+                      }
+                  }
+              }
+
+              private fun scanCorner(bmp: Bitmap, corners: List<Pair<Int, Int>>, cw: Int, ch: Int, i: Int) {
+                  if (i >= corners.size) { finishOcr(); return }
+                  val (ox, oy) = corners[i]
+                  val crop = Bitmap.createBitmap(bmp, ox, oy, cw, ch)
+                  val big = Bitmap.createScaledBitmap(crop, cw * 3, ch * 3, true)
+                  recognize(big) { lines ->
+                      val hit = lines.firstOrNull { it.first.trim().lowercase() in xGlyphs }
+                      if (hit != null) {
+                          tap(ox + hit.second.exactCenterX() / 3, oy + hit.second.exactCenterY() / 3)
+                          finishOcr()
+                      } else scanCorner(bmp, corners, cw, ch, i + 1)
+                  }
+              }
+
+              override fun onDestroy() { stop(); super.onDestroy() }
+          }
+          EOF
+      - name: Compilar
+        working-directory: AdCloser
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AdCloser-apk
+          path: AdCloser/app/build/outputs/apk/debug/app-debug.apk
